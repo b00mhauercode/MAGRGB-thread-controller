@@ -1,55 +1,66 @@
 """
-Magnus WLED Bridge (Thread Edition)
-Presents the Secretlab MAGRGB as a WLED device so SignalRGB's built-in
-WLED integration can discover and stream colors to it.
+Magnus HAP-BLE STRIPES Bridge
+Presents the Secretlab MAGRGB as a WLED device for SignalRGB, forwarding
+colors via the HAP-BLE STRIPES animation protocol (IID=60) with 10 zones.
 
-Colors are streamed directly to the device via UDP port 60222 (Nanoleaf
-external control protocol) over the Thread/IPv6 network — no HAP-BLE
-pairing required.
+10 zones gives a good balance: visible color variation without the strip
+looking like a blur. Each zone = 10% of the strip (segment=10).
 
 Requirements:
-  - Device must be reachable via its Thread IPv6 address (ping it to check)
-  - Nanoleaf Desktop app must be running on first launch to enable stream
-    control mode. After that it can be closed — the device holds the mode.
-  - DEVICE_INFO must be set in config_local.py (see config.py for template)
+  - Device must be paired (run pair.py first, produces pairing.json)
+  - config_local.py must have DEVICE_MAC set
 
 Usage:
-  Run as Administrator:  python magnus_wled_bridge.py
+  Run as Administrator:  python magnus_hapble_bridge.py
   (Port 80 requires admin on Windows)
 
 In SignalRGB:
   Home -> Lighting Services -> WLED -> "Discover WLED device by IP" -> 127.0.0.2
-  Press Enter -> "Magnus RGB Strip" will appear -> Link it.
 """
 import asyncio
 import colorsys
 import json
 import os
-import socket
 import socketserver
 import sys
 import threading
-import urllib.request
-import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
+from aiohomekit.characteristic_cache import CharacteristicCacheMemory
+from aiohomekit.controller.ble.controller import BleController
+from aiohomekit.model import Accessories, AccessoriesState
+
+from compat import CompatBleakScanner
+
 try:
-    from config_local import DEVICE_INFO, DEVICE_MAC
+    from config_local import DEVICE_MAC
 except ImportError:
-    from config import DEVICE_INFO, DEVICE_MAC
+    from config import DEVICE_MAC
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-DEVICE_IP     = DEVICE_INFO["ip"]        # Thread IPv6 address
-NANOLEAF_API  = "http://127.0.0.1:15765" # Nanoleaf Desktop local service
-NUM_ZONES     = 60
+PAIRING_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pairing.json")
+ALIAS         = "magrgb"
+WLED_MAC      = DEVICE_MAC.replace(":", "")
+
+# HAP characteristic IIDs
+AID            = 1
+IID_ON         = 51
+IID_ANIM_WRITE = 60
+
+# Animation config — 10 zones, each 10% of the strip
+NUM_ZONES     = 10
+ZONE_SEGMENT  = 10     # % of strip per zone (10 × 10 = 100%)
+TRANSIT_TIME  = 5      # fast transition
+SCENE_ID      = 1      # toggles between 1 and 2 each frame
+
+CMD_DISPLAY_SCENE = bytes([0x07, 0x01])
+CMD_DELETE_SCENE  = bytes([0x07, 0x05])
+
 HTTP_PORT     = 80
 UDP_PORT      = 21325
-STREAM_PORT   = 60222   # Nanoleaf external control UDP port on device
-SEND_INTERVAL = 0.05    # 20 Hz
-
-WLED_MAC = DEVICE_MAC.replace(":", "")
+SEND_INTERVAL = 0.1    # 10 Hz — HAP-BLE round-trip limit
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -57,9 +68,9 @@ WLED_MAC = DEVICE_MAC.replace(":", "")
 # ── Shared color state ─────────────────────────────────────────────────────────
 
 _lock          = threading.Lock()
-_pending_zones = None   # list of NUM_ZONES (r, g, b) tuples, or None
-_global_bri    = 100    # 0-100
-_udp_count     = 0      # debug: total UDP frames received
+_pending_zones = None
+_global_bri    = 100
+_udp_count     = 0
 
 
 def set_zones(zones):
@@ -80,7 +91,7 @@ WLED_INFO = {
     "ver": "0.14.0", "vid": 2310130,
     "leds": {"count": 123, "pwr": 0, "fps": 30, "maxpwr": 5, "maxseg": 32,
              "seglc": [123], "lc": 123, "rgbw": False, "wv": 0, "cct": 0},
-    "str": False, "name": "Magnus RGB Strip", "udpport": UDP_PORT,
+    "str": False, "name": "Magnus RGB Strip (HAP-BLE)", "udpport": UDP_PORT,
     "live": False, "lm": "", "lip": "", "ws": 0,
     "fxcount": 118, "palcount": 71, "cpalcount": 0,
     "wifi": {"bssid": "00:00:00:00:00:00", "rssi": -50, "signal": 100, "channel": 1},
@@ -163,7 +174,7 @@ class WLEDUdpHandler(socketserver.BaseRequestHandler):
         data = self.request[0]
         if len(data) < 7:
             return
-        if data[0] == 0x04:          # DRGB — 3 bytes per pixel after 4-byte header
+        if data[0] == 0x04:
             n = min(123, (len(data) - 4) // 3)
             if n > 0:
                 zones = []
@@ -185,85 +196,124 @@ class WLEDUdpHandler(socketserver.BaseRequestHandler):
             print(f"  UDP unknown protocol byte: 0x{data[0]:02x} (len={len(data)})")
 
 
-# ── Nanoleaf external control (UDP streaming) ──────────────────────────────────
+# ── HAP-BLE animation helpers ──────────────────────────────────────────────────
 
-def enable_stream_control():
-    """Ask Nanoleaf Desktop to put device in external control mode."""
-    device = {**DEVICE_INFO,
-              "shapeType": 2,
-              "scaleFactor": 3.195266272189349,
-              "panels": [{"panelID": 0, "centroidX": 1082, "centroidY": 1921}]}
-    body = json.dumps({"devices": [device]}).encode()
-    req = urllib.request.Request(
-        f"{NANOLEAF_API}/essentials/enableStreamControl",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def rgb_to_hapsv(r, g, b):
+    h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    return round(h * 360), round(s * 100), round(v * 100)
+
+
+def _tlv2(tag, value):
+    return bytes([tag, len(value)]) + value
+
+
+def _pack_color(hue, sat, bri):
+    i = (hue << 14) | (sat << 7) | bri
+    return bytes([(i >> 16) & 0xFF, (i >> 8) & 0xFF, i & 0xFF])
+
+
+def build_delete_scene(scene_id):
+    payload = _tlv2(0x01, bytes([scene_id]))
+    return bytes([0x07, 0x05]) + bytes([len(payload) >> 8, len(payload) & 0xFF]) + payload
+
+
+def build_stripes(scene_id, colors):
+    meta  = _tlv2(0x01, bytes([scene_id, 0x06, TRANSIT_TIME, 0, ZONE_SEGMENT]))
+    pal   = _tlv2(0x02, bytes([len(colors)]) + b"".join(_pack_color(*c) for c in colors))
+    inner = meta + pal
+    return CMD_DISPLAY_SCENE + bytes([len(inner) >> 8, len(inner) & 0xFF]) + inner
+
+
+# ── HAP-BLE loop ───────────────────────────────────────────────────────────────
+
+async def hap_loop():
+    with open(PAIRING_FILE) as f:
+        pairing_data = json.load(f)[ALIAS]
+
+    scanner    = CompatBleakScanner()
+    controller = BleController(
+        char_cache=CharacteristicCacheMemory(),
+        bleak_scanner_instance=scanner,
     )
-    with urllib.request.urlopen(req, timeout=3) as resp:
-        return resp.read()
+    await controller.async_start()
 
+    pairing = controller.load_pairing(ALIAS, pairing_data)
+    pairing._accessories_state = AccessoriesState(Accessories(), 0, None, 0)
 
-def make_stream_packet(r, g, b):
-    """Build a single-panel Nanoleaf external control UDP packet."""
-    # [numPanels(2)] + [panelID(2) R G B W transTime(2)] per panel
-    return bytes([0, 1,       # 1 panel
-                  0, 0,       # panelID 0
-                  r, g, b, 0, # RGB + white
-                  0, 1])      # transitionTime = 1 (fast)
+    print(f"Waiting for {DEVICE_MAC}...")
+    for _ in range(30):
+        await asyncio.sleep(1)
+        if pairing.description is not None:
+            print(f"Found: {pairing.description.name}")
+            break
+    else:
+        print("WARNING: Device not found, attempting anyway...")
 
+    # Clear stored scenes and do a fresh start
+    print("Clearing stored scenes...")
+    for sid in range(1, 11):
+        try:
+            await pairing.put_characteristics([(AID, IID_ANIM_WRITE, build_delete_scene(sid))])
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
 
-# ── Main loop ──────────────────────────────────────────────────────────────────
+    print("Startup: turning on...")
+    await pairing.put_characteristics([(AID, IID_ON, False)])
+    await asyncio.sleep(0.5)
+    await pairing.put_characteristics([(AID, IID_ON, True)])
+    await asyncio.sleep(1.0)
+    print("Ready.\n")
 
-async def stream_loop():
-    """Reads pending zones and streams color to device via UDP."""
+    last_time    = 0.0
+    last_sent    = None
+    scene_toggle = 1
 
-    # Try to enable stream control via Nanoleaf Desktop API
-    print(f"Enabling stream control via Nanoleaf Desktop...")
-    try:
-        resp = enable_stream_control()
-        print(f"  OK: {resp}")
-    except urllib.error.URLError:
-        print("  WARNING: Nanoleaf Desktop app not running.")
-        print("  Device may already be in stream control mode from a previous run.")
-        print("  Continuing anyway — UDP will work if mode is still active.\n")
-
-    # Open UDP socket for streaming
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    print(f"Streaming to [{DEVICE_IP}]:{STREAM_PORT}")
-    print("Stream loop running.\n")
-
-    loop       = asyncio.get_running_loop()
-    last_time  = 0.0
-    last_color = None
+    print("HAP-BLE loop running.\n")
 
     while True:
         try:
-            now = loop.time()
+            now = asyncio.get_running_loop().time()
             with _lock:
                 zones = _pending_zones
                 bri   = _global_bri
 
             if zones is not None and (now - last_time) >= SEND_INTERVAL:
-                # Average all zones to a single RGB color
-                n  = len(zones)
-                r  = round(sum(z[0] for z in zones) / n * bri / 100)
-                g  = round(sum(z[1] for z in zones) / n * bri / 100)
-                b  = round(sum(z[2] for z in zones) / n * bri / 100)
-                color = (r, g, b)
+                is_off = all(r == 0 and g == 0 and b == 0 for r, g, b in zones)
 
-                if color != last_color:
-                    pkt = make_stream_packet(r, g, b)
-                    sock.sendto(pkt, (DEVICE_IP, STREAM_PORT, 0, 0))
-                    last_color = color
-                    last_time  = now
-                    print(f"  UDP -> rgb({r},{g},{b})")
+                if is_off:
+                    try:
+                        await pairing.put_characteristics([(AID, IID_ON, False)])
+                        last_time = now
+                        last_sent = None
+                        print("  HAP -> OFF")
+                    except Exception as e:
+                        print(f"  HAP write error: {e}")
+                        await asyncio.sleep(2)
+                else:
+                    colors = []
+                    for r, g, b in zones:
+                        h, s, v = rgb_to_hapsv(r, g, b)
+                        colors.append((h, s, round(v * bri / 100)))
+
+                    if colors != last_sent:
+                        try:
+                            pkt = build_stripes(scene_toggle, colors)
+                            await pairing.put_characteristics([(AID, IID_ANIM_WRITE, pkt)])
+                            scene_toggle = 2 if scene_toggle == 1 else 1
+                            last_time = now
+                            last_sent = colors
+                            h0, s0, v0 = colors[0]
+                            print(f"  HAP -> {NUM_ZONES} zones  z0=hsv({h0},{s0},{v0})")
+                        except Exception as e:
+                            print(f"  HAP write error: {e}")
+                            await asyncio.sleep(2)
 
         except Exception as e:
-            print(f"Stream loop error: {e}")
-            await asyncio.sleep(1)
+            print(f"HAP loop error: {e}")
+            await asyncio.sleep(2)
 
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -281,7 +331,7 @@ def main():
         user = os.environ.get("USERNAME", "Everyone")
         print(f"\nERROR: Port 80 requires Administrator.")
         print(f"  Option A: Right-click terminal -> 'Run as administrator'")
-        print(f"  Option B (one-time): run in admin prompt then re-run normally:")
+        print(f"  Option B (one-time):")
         print(f"    netsh http add urlacl url=http://127.0.0.2:80/ user={user}")
         sys.exit(1)
 
@@ -290,7 +340,7 @@ def main():
     print("Ctrl+C to quit\n")
 
     try:
-        asyncio.run(stream_loop())
+        asyncio.run(hap_loop())
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:

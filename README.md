@@ -122,27 +122,104 @@ HAP-BLE uses a standard Pair-Verify handshake (X25519 + Ed25519) after pairing t
 
 Control packets go through aiohomekit's `put_characteristics([(aid, iid, value)])`:
 
-| Parameter | Value |
-|---|---|
-| AID | `1` (always 1 for BLE accessories) |
-| IID_ON | `51` — boolean |
-| IID_BRI | `52` — integer 0–100 |
-| IID_HUE | `53` — integer 0–360 |
-| IID_SAT | `54` — integer 0–100 |
-
-### Color Conversion
-
-```python
-import colorsys
-
-def rgb_to_hapsv(r, g, b):
-    h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-    return round(h * 360), round(s * 100), round(v * 100)
-```
+| Characteristic | IID | Type |
+|---|---|---|
+| On / Off | `51` | boolean |
+| Brightness | `52` | int 0–100 |
+| Hue | `53` | int 0–360 |
+| Saturation | `54` | int 0–100 |
+| COMMAND_INTERFACE | `60` | bytes — Nanoleaf animation writes |
 
 ### Off vs On
 
 HAP has a discrete On/Off characteristic (IID 51). Sending RGB `(0,0,0)` does NOT turn off the light — you must write `False` to IID_ON. The bridge handles this automatically.
+
+---
+
+## Per-Zone Control (Animation Protocol)
+
+The bridge uses the **Nanoleaf Animation Protocol** via HAP COMMAND_INTERFACE (IID 60, UUID `A28E1902`) to achieve per-zone color control across 60 independent zones. This was reverse-engineered from the Nanoleaf Android app (`me.nanoleaf.nanoleaf`) using JADX.
+
+### Discovery Path
+
+The device exposes a Nanoleaf Animation Service (`A18E6901-...`) with several characteristics, but **none of these are accessible via HAP** — they are filtered out at the firmware level. The actual animation path was found in `CommandCentreRepository.java`:
+
+```java
+// Line 6203 / 10806 — writes animation to COMMAND_INTERFACE, not ANIMATION_WRITE
+new Ee.a(TlvType.DISPLAY_SCENE, scene.toByteArray(accessoryType)).formattedByteArray()
+```
+
+The LTPDU service (`6D2AE1C4-...`) uses a separate Curve25519 + AES-CTR encrypted channel but **animation commands are explicitly filtered out of LTPDU** (`n.java` line 506). All animation traffic goes through the HAP session.
+
+### Wire Format
+
+Every animation write to IID=60 uses this outer frame:
+
+```
+[cmd_hi, cmd_lo, len_hi, len_lo, ...TLV2 bytes...]
+```
+
+Where `cmd_hi cmd_lo` is the command type (DISPLAY_SCENE = `07 01`), followed by a 2-byte big-endian length, followed by the TLV2 animation payload.
+
+**TLV2 payload** = `metaDataTlv + paletteTlv`
+
+```
+MetaData TLV (tag=0x01, 1-byte length):
+  STRIPES (0x06):  [sceneId, 0x06, transitTime, direction, segment]
+  FLOW    (0x05):  [sceneId, 0x05, transitTime, waitTime, direction, loopByte]
+  FADE    (0x01):  [sceneId, 0x01, transitTime, waitTime, loopByte]
+
+Palette TLV (tag=0x02, 1-byte length, max 84 colors):
+  [numColors, c0_b2, c0_b1, c0_b0, ...]
+  Each color is 3-byte big-endian:
+    bit23     = repeat flag
+    bits22-14 = hue   (0–360)
+    bits13-7  = sat   (0–100)
+    bits6-0   = bri   (0–100)
+  i = (repeat<<23) | (hue<<14) | (sat<<7) | bri
+```
+
+### STRIPES Effect
+
+STRIPES divides the strip into equal segments, one color per segment. The `segment` parameter is the width of each segment as a percentage of the total strip length:
+
+| `segment` value | Zones | Result |
+|---|---|---|
+| 33 | 3 | three equal thirds |
+| 14 | ~7 | rainbow |
+| 5 | 20 | coarse zones |
+| **2** | **60** | **production setting** |
+| 1 | 84 | finest (max without 2-byte palette) |
+
+STRIPES and FLOW are only supported on `SECRETLABS_LIGHT_STRIPS` device type — confirmed working on the MAGRGB.
+
+### Production Configuration
+
+The bridge uses **60 zones** (`segment=2`):
+- 190-byte packet per frame — well within BLE MTU after HAP fragmentation
+- Uses standard 1-byte TLV length (60 colors × 3 bytes + 1 = 181 bytes < 255)
+- 123 SignalRGB pixels bucketed into 60 equal zones (~2 pixels per zone average)
+- Visually indistinguishable from 84 or 123 zones at desk distance
+
+```python
+# Packet structure (190 bytes total):
+# [07 01]          — DISPLAY_SCENE command
+# [00 BC]          — TLV2 length = 188
+# [01 05 01 06 00 00 02]   — MetaData TLV: STRIPES, transit=0, dir=0, seg=2
+# [02 BD 3C ...]           — Palette TLV: 60 colors × 3 bytes
+```
+
+### Sources (Nanoleaf APK, JADX decompile)
+
+| File | Finding |
+|---|---|
+| `CommandCentreRepository.java` | Animation writes to COMMAND_INTERFACE (IID=60), not ANIMATION_WRITE (A18E6903) |
+| `EndpointLookup.java` | `Endpoints.CommandInterface` is the animation endpoint |
+| `n.java` | CommandInterface commands filtered OUT of LTPDU — confirms HAP-only path |
+| `SimpleScene.java` | TLV2 wire format (metaDataTlv + paletteTlv) |
+| `EffectType.java` | Effect byte values (STRIPES=6, FLOW=5, FADE=1, RANDOM=2, HIGHLIGHT=3) |
+| `TlvType2.java` / `Tlv2.java` | Tag byte constants and 1-byte length encoding |
+| `ze/C8489a.java` | LTPDU Curve25519 + AES-CTR crypto (not used for animation) |
 
 ---
 
@@ -275,7 +352,8 @@ Drag the Magnus RGB Strip block on your canvas and assign any effect.
 ║  │  Canvas effect  │─────▶│  HTTP :80    (WLED discovery)      │  ║
 ║  │  assigns color  │ UDP  │  UDP  :21325 (DRGB color stream)   │  ║
 ║  │  to MAGRGB      │─────▶│                                    │  ║
-║  └─────────────────┘      │  RGB→HSV conversion                │  ║
+║  └─────────────────┘      │  bucket 123px → 60 zones           │  ║
+║                            │  RGB→HSV, STRIPES packet → IID=60  │  ║
 ║                            │  HAP-BLE asyncio loop, max 10 Hz  │  ║
 ║                            └───────────────┬────────────────────┘  ║
 ║                                            │ HAP-BLE               ║
@@ -317,9 +395,10 @@ Drag the Magnus RGB Strip block on your canvas and assign any effect.
 
 ## Future Work
 
-- [ ] Thread provisioning + LTPDU protocol support (enables scenes/effects from the Nanoleaf ecosystem)
+- [x] Per-zone color control — 60-zone STRIPES via COMMAND_INTERFACE (IID=60), confirmed working
 - [ ] Auto-detect HAP MAC address on startup (handles address rotation after reset)
 - [ ] Apple HomeKit re-integration alongside bridge (HAP supports up to 16 controllers)
+- [ ] LTPDU integration — crypto is fully reverse-engineered (Curve25519 + AES-CTR); could enable firmware or non-animation commands. Animation itself goes via HAP, not LTPDU.
 
 ---
 

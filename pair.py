@@ -25,9 +25,10 @@ from aiohomekit.protocol import perform_pair_setup_part1, perform_pair_setup_par
 
 logging.basicConfig(level=logging.WARNING)
 
-# EDIT THIS: set to the HAP-BLE MAC address of your MAGRGB strip.
-# Run scan.py to find it — look for the address with Manufacturer ID 76 (Apple).
-DEVICE_MAC   = "XX:XX:XX:XX:XX:XX"
+try:
+    from config_local import DEVICE_MAC
+except ImportError:
+    from config import DEVICE_MAC
 ALIAS        = "magrgb"
 PAIRING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pairing.json")
 

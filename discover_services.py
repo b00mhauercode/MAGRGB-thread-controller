@@ -2,9 +2,10 @@
 import asyncio
 from bleak import BleakClient, BleakScanner
 
-# EDIT THIS: set to the HAP-BLE MAC address of your MAGRGB strip.
-# Run scan.py to find it — look for the address with Manufacturer ID 76 (Apple).
-DEVICE_MAC = "XX:XX:XX:XX:XX:XX"
+try:
+    from config_local import DEVICE_MAC
+except ImportError:
+    from config import DEVICE_MAC
 
 async def main():
     print(f"Connecting to {DEVICE_MAC}...")

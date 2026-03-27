@@ -1,3 +1,11 @@
+# Personal device configuration — never commit this
+config_local.py
+
+# Research / experimental scripts — not part of the released bridge
+animate_test.py
+discover_hap_chars.py
+ltpdu_test.py
+
 # HAP pairing credentials — contains iOSDeviceLTSK (your private long-term secret key).
 # Anyone with this file can impersonate your controller to the device.
 # Generate your own with: python pair.py XXX-XX-XXX
@@ -36,3 +44,4 @@ Thumbs.db
 
 # OS
 .DS_Store
+.claude/

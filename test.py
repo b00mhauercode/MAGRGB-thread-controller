@@ -13,9 +13,10 @@ from aiohomekit.model import Accessories, AccessoriesState
 
 from compat import CompatBleakScanner
 
-# EDIT THIS: set to the HAP-BLE MAC address of your MAGRGB strip.
-# Run scan.py to find it — look for the address with Manufacturer ID 76 (Apple).
-DEVICE_MAC   = "XX:XX:XX:XX:XX:XX"
+try:
+    from config_local import DEVICE_MAC
+except ImportError:
+    from config import DEVICE_MAC
 PAIRING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pairing.json")
 ALIAS        = "magrgb"
 

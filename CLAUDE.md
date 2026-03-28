@@ -121,9 +121,13 @@ SignalRGB                magnus_wled_bridge.py             MAGRGB strip
 
 Use Task Scheduler to run `magnus_wled_bridge.py` at startup with **"Run with highest privileges"** and a 30-second startup delay. See README.md for full steps.
 
-## Nanoleaf Animation Protocol (Per-Zone Control)
+## Nanoleaf Animation Protocol (Per-Zone Control) — NOT WORKING
 
-The MAGRGB exposes animation control via the **COMMAND_INTERFACE** HAP characteristic (IID=60, UUID `A28E1902-CFA1-4D37-A10F-0071CEEEEEBD`) — part of the Lightbulb service. **Confirmed working.**
+> **The animation path is broken in practice.** Writes to IID 60 (`COMMAND_INTERFACE`) are accepted at the HAP/GATT level without errors but the device does not apply them — strip stays white.
+> The bridge now uses lightbulb characteristics (IID 51–54) for reliable single-colour control.
+> See README.md § Known Issues for the full investigation.
+
+The MAGRGB exposes animation control via the **COMMAND_INTERFACE** HAP characteristic (IID=60, UUID `A28E1902-CFA1-4D37-A10F-0071CEEEEEBD`) — part of the Lightbulb service. ~~Confirmed working.~~ **Does not work — device ignores writes.**
 
 ### Wire Format
 

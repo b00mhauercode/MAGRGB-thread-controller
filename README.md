@@ -1,5 +1,7 @@
 # Secretlab MAGRGB BLE Controller
 
+> ⚠️ **This repository is archived.** Per-zone animation via `COMMAND_INTERFACE` (IID 60) was confirmed non-functional — the device silently ignores writes regardless of packet format. Active development has moved to [magrgb-controller](https://github.com/b00mhauercode/magrgb-controller), which uses the reliable HAP lightbulb characteristics (IID 51–54). This repo is kept for protocol research reference only.
+
 > Full Python controller, SignalRGB integration, and technical protocol documentation for the **Secretlab Magnus XL RGB Strip** (co-developed with Nanoleaf, sold as MAGRGB).
 
 ---
@@ -395,7 +397,7 @@ Drag the Magnus RGB Strip block on your canvas and assign any effect.
 
 ## Future Work
 
-- [x] Per-zone color control — 60-zone STRIPES via COMMAND_INTERFACE (IID=60), confirmed working
+- [ ] Per-zone color control — IID 60 (`COMMAND_INTERFACE`) packet format is correct per Nanoleaf APK source, but device ignores writes in practice (no error, no visual response). Bridge falls back to lightbulb IID 51–54 (single colour). Root cause unknown.
 - [ ] Auto-detect HAP MAC address on startup (handles address rotation after reset)
 - [ ] Apple HomeKit re-integration alongside bridge (HAP supports up to 16 controllers)
 - [ ] LTPDU integration — crypto is fully reverse-engineered (Curve25519 + AES-CTR); could enable firmware or non-animation commands. Animation itself goes via HAP, not LTPDU.
